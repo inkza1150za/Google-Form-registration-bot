@@ -7,3 +7,6 @@ target/
 
 # VS Code
 .vscode/
+
+# ไฟล์คำตอบ มีข้อมูลส่วนตัว
+answers.txt
