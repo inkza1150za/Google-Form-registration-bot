@@ -18,6 +18,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Entry point. Reads a Google Form, fills it in, and optionally submits.
@@ -35,6 +39,9 @@ import java.util.Set;
 public class App {
 
     private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    /** Upper bound on parallel submissions. */
+    private static final int MAX_THREADS = 16;
 
     public static void main(String[] args) {
         useUtf8Console();
@@ -146,54 +153,95 @@ public class App {
         }
         System.out.println();
 
-        int sent = 0;
-        int failed = 0;
+        int threads = threadCount();
+        if (threads > 1) {
+            System.out.println("ยิงพร้อมกัน " + threads + " สาย — ลำดับบรรทัดที่พิมพ์ออกมาจะสลับกันได้");
+            System.out.println();
+        }
+
+        AtomicInteger sent = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
         int skipped = 0;
-        for (int i = 0; i < rows.size(); i++) {
-            int row = i + 1;
-            Map<String, String> person = rows.get(i);
-            String label = fromCsv ? "[" + row + "/" + rows.size() + "] " + describe(person) : describe(person);
 
-            if (alreadySent.contains(row)) {
-                System.out.println(label + " — ส่งไปแล้ว ข้าม");
-                skipped++;
-                continue;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            for (int i = 0; i < rows.size(); i++) {
+                int row = i + 1;
+                Map<String, String> person = rows.get(i);
+                String label = fromCsv ? "[" + row + "/" + rows.size() + "] " + describe(person) : describe(person);
+
+                if (alreadySent.contains(row)) {
+                    System.out.println(label + " — ส่งไปแล้ว ข้าม");
+                    skipped++;
+                    continue;
+                }
+
+                pool.execute(() -> sendOne(form, fields, person, label, row, submit, fromCsv,
+                        resultsFile, sent, failed));
+
+                if (i < rows.size() - 1 && delaySeconds > 0) {
+                    sleep(delaySeconds);
+                }
             }
-
-            System.out.println(label);
+        } finally {
+            pool.shutdown();
             try {
-                Map<String, String> byEntryId = entryValues(fields, person);
-                if (byEntryId.isEmpty()) {
-                    throw new IllegalStateException("คำตอบไม่ตรงกับคำถามในฟอร์มสักช่อง");
-                }
-                if (submit) {
-                    form.submit(byEntryId);
-                    if (fromCsv) {
-                        record(resultsFile, row, "ส่งแล้ว", describe(person));
-                    }
-                    System.out.println("   ส่งแล้ว");
-                } else {
-                    System.out.println("   เตรียมครบ " + byEntryId.size() + " ช่อง (ยังไม่ส่ง)");
-                }
-                sent++;
-            } catch (RuntimeException e) {
-                failed++;
-                System.out.println("   พลาด: " + e.getMessage());
-                if (fromCsv) {
-                    record(resultsFile, row, "พลาด", e.getMessage());
-                }
-            }
-
-            if (i < rows.size() - 1 && delaySeconds > 0) {
-                sleep(delaySeconds);
+                pool.awaitTermination(1, TimeUnit.HOURS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                pool.shutdownNow();
             }
         }
 
         if (fromCsv) {
             System.out.println();
-            System.out.println("สรุป: สำเร็จ " + sent + " | พลาด " + failed + " | ข้าม " + skipped
+            System.out.println("สรุป: สำเร็จ " + sent.get() + " | พลาด " + failed.get() + " | ข้าม " + skipped
                     + " | ทั้งหมด " + rows.size());
         }
+    }
+
+    /**
+     * Sends one person's answers. Runs on a worker thread when several are sent at once, so it
+     * builds each line of output in full before printing — otherwise the lines interleave mid-word.
+     */
+    private static void sendOne(HttpFormClient form, List<FormField> fields, Map<String, String> person,
+            String label, int row, boolean submit, boolean fromCsv, Path resultsFile,
+            AtomicInteger sent, AtomicInteger failed) {
+        try {
+            Map<String, String> byEntryId = entryValues(fields, person);
+            if (byEntryId.isEmpty()) {
+                throw new IllegalStateException("คำตอบไม่ตรงกับคำถามในฟอร์มสักช่อง");
+            }
+            if (submit) {
+                form.submit(byEntryId);
+                if (fromCsv) {
+                    record(resultsFile, row, "ส่งแล้ว", describe(person));
+                }
+                System.out.println(label + " — ส่งแล้ว");
+            } else {
+                System.out.println(label + " — เตรียมครบ " + byEntryId.size() + " ช่อง (ยังไม่ส่ง)");
+            }
+            sent.incrementAndGet();
+        } catch (RuntimeException e) {
+            failed.incrementAndGet();
+            System.out.println(label + " — พลาด: " + e.getMessage());
+            if (fromCsv) {
+                record(resultsFile, row, "พลาด", e.getMessage());
+            }
+        }
+    }
+
+    /** How many responses to send at the same time. Capped so a typo cannot open hundreds of them. */
+    private static int threadCount() {
+        long requested = seconds("threads", 1);
+        if (requested < 1) {
+            return 1;
+        }
+        if (requested > MAX_THREADS) {
+            System.out.println("จำกัดจำนวนสายไว้ที่ " + MAX_THREADS + " (ขอมา " + requested + ")");
+            return MAX_THREADS;
+        }
+        return (int) requested;
     }
 
     private static void printFields(List<FormField> fields) {
@@ -394,8 +442,11 @@ public class App {
         return String.join(" ", parts);
     }
 
-    /** Appends one line to the results file so progress survives a crash. */
-    private static void record(Path file, int row, String status, String note) {
+    /**
+     * Appends one line to the results file so progress survives a crash.
+     * Synchronized because several threads finish at once when sending in parallel.
+     */
+    private static synchronized void record(Path file, int row, String status, String note) {
         String line = row + "," + status + "," + LocalDateTime.now().format(TIMESTAMP)
                 + ",\"" + note.replace("\"", "'") + "\"" + System.lineSeparator();
         try {
@@ -520,6 +571,7 @@ public class App {
                   -Dpeople=<path>    ไฟล์ CSV หลายคน กรอกทีละแถวจนครบ
                   -Dresults=<path>   ไฟล์บันทึกว่าใครส่งแล้ว (ปกติคือ results.csv)
                   -Dmode=http        ส่งตรงไม่เปิด Chrome เร็วกว่ามาก (ปกติใช้ Chrome)
+                  -Dthreads=<จำนวน>   ยิงพร้อมกันกี่สาย ใช้ได้กับ -Dmode=http (ปกติ 1)
                   -Ddelay=<วินาที>    เว้นระยะระหว่างแต่ละคน (ปกติ 5 วิ)
                   -Dwait=<วินาที>     ถ้าฟอร์มยังปิด ให้รอจนเปิด (ปกติไม่รอ)
                   -Dpoll=<วินาที>     ระหว่างรอ เช็กถี่แค่ไหน (ปกติ 3 วิ)
