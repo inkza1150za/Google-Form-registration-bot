@@ -12,3 +12,6 @@ target/
 answers.txt
 people.csv
 results.csv
+
+# โครงฟอร์มที่บอทจำไว้ ผูกกับฟอร์มใบใดใบหนึ่ง
+schema.tsv

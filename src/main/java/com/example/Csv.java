@@ -27,6 +27,12 @@ final class Csv {
             throw new IllegalStateException("อ่านไฟล์ไม่ได้: " + file, e);
         }
 
+        if (!lines.isEmpty()) {
+            // Excel's "CSV UTF-8" starts the file with a byte order mark, which would otherwise
+            // become part of the first column name and stop it matching any question
+            lines.set(0, lines.get(0).replace("﻿", ""));
+        }
+
         List<String> header = null;
         List<Map<String, String>> rows = new ArrayList<>();
         for (String line : lines) {

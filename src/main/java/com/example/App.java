@@ -9,7 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -112,16 +114,33 @@ public class App {
             boolean submit, long delaySeconds, long waitSeconds, long pollSeconds, Path resultsFile) {
 
         HttpFormClient form = new HttpFormClient(url);
+        Path schemaFile = Path.of(System.getProperty("schema", "schema.tsv"));
+
         List<FormField> fields;
         try {
-            if (waitSeconds > 0) {
+            fields = form.readFields();
+            FormSchema.save(schemaFile, fields);
+        } catch (FormClosedException closed) {
+            // Nothing to read while it is closed — fall back to the questions we saw last time,
+            // which is what lets us fire the instant it opens instead of downloading the page first
+            fields = FormSchema.load(schemaFile);
+            if (!fields.isEmpty()) {
+                System.out.println("ฟอร์มยังปิด แต่มีโครงที่บันทึกไว้ (" + schemaFile + ") — พร้อมยิงทันทีที่เปิด");
+            } else if (waitSeconds > 0) {
                 System.out.println("รอฟอร์มเปิด (รอไม่เกิน " + waitSeconds + " วิ, เช็กทุก " + pollSeconds + " วิ)");
-                fields = form.waitUntilOpen(Duration.ofSeconds(pollSeconds), Duration.ofSeconds(waitSeconds));
+                try {
+                    fields = form.waitUntilOpen(Duration.ofSeconds(pollSeconds), Duration.ofSeconds(waitSeconds));
+                } catch (FormClosedException | IllegalStateException e) {
+                    System.out.println(e.getMessage());
+                    return;
+                }
+                FormSchema.save(schemaFile, fields);
                 System.out.println("ฟอร์มเปิดแล้ว");
             } else {
-                fields = form.readFields();
+                System.out.println(closed.getMessage());
+                return;
             }
-        } catch (FormClosedException | IllegalStateException e) {
+        } catch (IllegalStateException e) {
             System.out.println(e.getMessage());
             return;
         }
@@ -130,8 +149,9 @@ public class App {
             System.out.println("อ่านคำถามจากหน้าเว็บไม่ได้ — ลองรันโหมดปกติ (ตัด \"-Dmode=http\" ออก) ดูว่าเห็นคำถามไหม");
             return;
         }
-        printFields(fields);
-        warnAboutDuplicateTitles(fields);
+        List<FormField> questions = fields;
+        printFields(questions);
+        warnAboutDuplicateTitles(questions);
 
         List<Map<String, String>> rows = people;
         boolean fromCsv = !people.isEmpty();
@@ -159,6 +179,9 @@ public class App {
             System.out.println();
         }
 
+        waitUntilStartTime();
+        Instant openingWindow = Instant.now().plusSeconds(Math.max(waitSeconds, 0));
+
         AtomicInteger sent = new AtomicInteger();
         AtomicInteger failed = new AtomicInteger();
         int skipped = 0;
@@ -176,8 +199,8 @@ public class App {
                     continue;
                 }
 
-                pool.execute(() -> sendOne(form, fields, person, label, row, submit, fromCsv,
-                        resultsFile, sent, failed));
+                pool.execute(() -> sendOne(form, questions, person, label, row, submit, fromCsv,
+                        resultsFile, sent, failed, openingWindow));
 
                 if (i < rows.size() - 1 && delaySeconds > 0) {
                     sleep(delaySeconds);
@@ -206,18 +229,18 @@ public class App {
      */
     private static void sendOne(HttpFormClient form, List<FormField> fields, Map<String, String> person,
             String label, int row, boolean submit, boolean fromCsv, Path resultsFile,
-            AtomicInteger sent, AtomicInteger failed) {
+            AtomicInteger sent, AtomicInteger failed, Instant openingWindow) {
         try {
             Map<String, String> byEntryId = entryValues(fields, person);
             if (byEntryId.isEmpty()) {
                 throw new IllegalStateException("คำตอบไม่ตรงกับคำถามในฟอร์มสักช่อง");
             }
             if (submit) {
-                form.submit(byEntryId);
+                int attempts = submitWithRetry(form, byEntryId, label, openingWindow);
                 if (fromCsv) {
                     record(resultsFile, row, "ส่งแล้ว", describe(person));
                 }
-                System.out.println(label + " — ส่งแล้ว");
+                System.out.println(label + " — ส่งแล้ว" + (attempts > 1 ? " (ลอง " + attempts + " ครั้ง)" : ""));
             } else {
                 System.out.println(label + " — เตรียมครบ " + byEntryId.size() + " ช่อง (ยังไม่ส่ง)");
             }
@@ -228,6 +251,71 @@ public class App {
             if (fromCsv) {
                 record(resultsFile, row, "พลาด", e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Posts one response, retrying on failure. A form that has just switched from closed to open
+     * can reject the first attempts for a moment, which is what makes an unattended run look like
+     * it worked for some people and not others.
+     *
+     * @return how many attempts it took
+     */
+    private static int submitWithRetry(HttpFormClient form, Map<String, String> byEntryId, String label,
+            Instant openingWindow) {
+        int maxAttempts = (int) Math.max(1, seconds("retry", 3));
+        RuntimeException lastFailure = null;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                form.submit(byEntryId);
+                return attempt;
+            } catch (RuntimeException e) {
+                lastFailure = e;
+                if (Instant.now().isBefore(openingWindow)) {
+                    // Still inside the window we were told to wait: the form has probably not
+                    // started accepting yet, so keep knocking instead of giving up
+                    sleepMillis(250);
+                    continue;
+                }
+                if (attempt >= maxAttempts) {
+                    throw lastFailure;
+                }
+                System.out.println(label + " — ครั้งที่ " + attempt + " ไม่ผ่าน (" + e.getMessage() + ") ลองใหม่");
+                sleepMillis(1000);
+            }
+        }
+    }
+
+    /** Sleeps until the wall clock reaches {@code -Dstart}, so the first request goes out on time. */
+    private static void waitUntilStartTime() {
+        String startAt = System.getProperty("start", "").trim();
+        if (startAt.isEmpty()) {
+            return;
+        }
+        LocalTime target;
+        try {
+            target = LocalTime.parse(startAt);
+        } catch (RuntimeException e) {
+            System.out.println("ค่า -Dstart=" + startAt + " อ่านไม่ออก ต้องเป็นรูปแบบ HH:mm หรือ HH:mm:ss — จะเริ่มทันที");
+            return;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime fireAt = now.toLocalDate().atTime(target);
+        if (!fireAt.isAfter(now)) {
+            fireAt = fireAt.plusDays(1);
+        }
+        Duration until = Duration.between(now, fireAt);
+        System.out.println("รอถึงเวลา " + target + " (อีก " + until.toSeconds() + " วินาที)");
+        sleepMillis(until.toMillis());
+        System.out.println("ถึงเวลาแล้ว ยิงเลย");
+    }
+
+    private static void sleepMillis(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("ถูกสั่งหยุดระหว่างรอ", e);
         }
     }
 
@@ -496,7 +584,7 @@ public class App {
         }
         try {
             for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-                String trimmed = line.trim();
+                String trimmed = line.replace("﻿", "").trim();
                 if (trimmed.isEmpty() || trimmed.startsWith("#")) {
                     continue;
                 }
@@ -572,6 +660,9 @@ public class App {
                   -Dresults=<path>   ไฟล์บันทึกว่าใครส่งแล้ว (ปกติคือ results.csv)
                   -Dmode=http        ส่งตรงไม่เปิด Chrome เร็วกว่ามาก (ปกติใช้ Chrome)
                   -Dthreads=<จำนวน>   ยิงพร้อมกันกี่สาย ใช้ได้กับ -Dmode=http (ปกติ 1)
+                  -Dretry=<จำนวน>     ถ้าส่งไม่ผ่าน ลองใหม่กี่ครั้ง (ปกติ 3)
+                  -Dstart=HH:mm:ss   นอนรอจนถึงเวลานี้แล้วค่อยยิง (ปกติยิงทันที)
+                  -Dschema=<path>    ไฟล์จำโครงฟอร์ม ทำให้ยิงได้ทันทีที่เปิด (ปกติ schema.tsv)
                   -Ddelay=<วินาที>    เว้นระยะระหว่างแต่ละคน (ปกติ 5 วิ)
                   -Dwait=<วินาที>     ถ้าฟอร์มยังปิด ให้รอจนเปิด (ปกติไม่รอ)
                   -Dpoll=<วินาที>     ระหว่างรอ เช็กถี่แค่ไหน (ปกติ 3 วิ)

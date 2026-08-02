@@ -94,17 +94,31 @@ public class HttpFormClient {
         }
     }
 
-    /** Posts one response. */
+    /**
+     * Posts one response and checks that it was actually recorded.
+     *
+     * <p>HTTP 200 on its own proves nothing: when Google refuses a response it answers 200 and
+     * simply hands the form back. A recorded response gets the confirmation page instead, which
+     * carries no {@code data-params} because it has no questions on it.
+     */
     public void submit(Map<String, String> answersByEntryId) {
         HttpRequest request = HttpRequest.newBuilder(responseUrl)
                 .timeout(Duration.ofSeconds(30))
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 .POST(HttpRequest.BodyPublishers.ofString(encode(answersByEntryId), StandardCharsets.UTF_8))
                 .build();
-        HttpResponse<Void> response = send(request, HttpResponse.BodyHandlers.discarding());
+        HttpResponse<String> response = send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
         if (response.statusCode() != 200) {
             throw new IllegalStateException("ฟอร์มตอบกลับ HTTP " + response.statusCode()
-                    + " — คำตอบอาจไม่ตรงกับตัวเลือกที่ฟอร์มยอมรับ");
+                    + " — คำตอบอาจไม่ครบหรือไม่ตรงกับตัวเลือกที่ฟอร์มยอมรับ");
+        }
+        if (response.uri().toString().contains("closedform")) {
+            throw new FormClosedException("ฟอร์มปิดรับคำตอบไปแล้ว คำตอบนี้ไม่ถูกบันทึก");
+        }
+        if (response.body().contains("data-params")) {
+            throw new IllegalStateException(
+                    "ฟอร์มส่งหน้าเดิมกลับมาแทนหน้ายืนยัน — คำตอบนี้ไม่ถูกบันทึก");
         }
     }
 
