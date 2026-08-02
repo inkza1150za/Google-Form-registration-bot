@@ -113,6 +113,10 @@ public class App {
     private static void runHttpMode(String url, List<Map<String, String>> people, Path answersFile,
             boolean submit, long delaySeconds, long waitSeconds, long pollSeconds, Path resultsFile) {
 
+        // Before anything else: -Dstart means "do not begin before this time", and reading the
+        // form first would let that moment slip past while we were still downloading pages
+        waitUntilStartTime();
+
         HttpFormClient form = new HttpFormClient(url);
         Path schemaFile = Path.of(System.getProperty("schema", "schema.tsv"));
 
@@ -181,7 +185,6 @@ public class App {
             System.out.println();
         }
 
-        waitUntilStartTime();
         Instant openingWindow = Instant.now().plusSeconds(Math.max(waitSeconds, 0));
 
         AtomicInteger sent = new AtomicInteger();
@@ -304,12 +307,19 @@ public class App {
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime fireAt = now.toLocalDate().atTime(target);
         if (!fireAt.isAfter(now)) {
-            fireAt = fireAt.plusDays(1);
+            Duration late = Duration.between(fireAt, now);
+            if (late.toHours() < 12) {
+                // The moment has only just gone by — being a little late is no reason to sit out
+                // until tomorrow, which would mean missing the registration entirely
+                System.out.println("เลยเวลา " + target + " มา " + late.toSeconds() + " วินาทีแล้ว — เริ่มทันที");
+                return;
+            }
+            fireAt = fireAt.plusDays(1); // e.g. asking for 00:00 while it is still late evening
         }
         Duration until = Duration.between(now, fireAt);
         System.out.println("รอถึงเวลา " + target + " (อีก " + until.toSeconds() + " วินาที)");
         sleepMillis(until.toMillis());
-        System.out.println("ถึงเวลาแล้ว ยิงเลย");
+        System.out.println("ถึงเวลาแล้ว เริ่มเลย");
     }
 
     private static void sleepMillis(long millis) {
