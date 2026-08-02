@@ -113,45 +113,48 @@ public class App {
     private static void runHttpMode(String url, List<Map<String, String>> people, Path answersFile,
             boolean submit, long delaySeconds, long waitSeconds, long pollSeconds, Path resultsFile) {
 
-        // Before anything else: -Dstart means "do not begin before this time", and reading the
-        // form first would let that moment slip past while we were still downloading pages
-        waitUntilStartTime();
-
         HttpFormClient form = new HttpFormClient(url);
-        Path schemaFile = Path.of(System.getProperty("schema", "schema.tsv"));
+        String schemaProperty = System.getProperty("schema", "");
+        Path schemaFile = schemaProperty.isBlank()
+                ? FormSchema.defaultPathFor(url)
+                : Path.of(schemaProperty);
 
+        // Work out the questions *before* -Dstart arrives. This page download costs about a
+        // second, and a second spent here is a second the form is open and we are not sending.
+        // It also opens the connection to Google, so the first real POST skips the handshake.
         List<FormField> fields;
         try {
             fields = form.readFields();
-            FormSchema.save(schemaFile, fields);
+            FormSchema.save(schemaFile, url, fields);
         } catch (FormClosedException closed) {
-            // Nothing to read while it is closed — fall back to the questions we saw last time,
-            // which is what lets us fire the instant it opens instead of downloading the page first
-            fields = FormSchema.load(schemaFile);
+            fields = FormSchema.load(schemaFile, url);
             if (!fields.isEmpty()) {
                 System.out.println("ฟอร์มยังปิด แต่มีโครงที่บันทึกไว้ (" + schemaFile + ") — พร้อมยิงทันทีที่เปิด");
-            } else if (waitSeconds > 0) {
-                System.out.println("รอฟอร์มเปิด (รอไม่เกิน " + waitSeconds + " วิ, เช็กทุก " + pollSeconds + " วิ)");
-                try {
-                    fields = form.waitUntilOpen(Duration.ofSeconds(pollSeconds), Duration.ofSeconds(waitSeconds));
-                } catch (FormClosedException | IllegalStateException e) {
-                    System.out.println(e.getMessage());
-                    return;
-                }
-                FormSchema.save(schemaFile, fields);
-                System.out.println("ฟอร์มเปิดแล้ว");
-            } else {
-                System.out.println(closed.getMessage());
-                return;
             }
         } catch (IllegalStateException e) {
             System.out.println(e.getMessage());
             return;
         }
 
+        // -Dstart means "do not begin before this time"
+        waitUntilStartTime();
+
         if (fields.isEmpty()) {
-            System.out.println("อ่านคำถามจากหน้าเว็บไม่ได้ — ลองรันโหมดปกติ (ตัด \"-Dmode=http\" ออก) ดูว่าเห็นคำถามไหม");
-            return;
+            if (waitSeconds <= 0) {
+                System.out.println("ฟอร์มยังไม่เปิดรับคำตอบ และไม่มีโครงที่บันทึกไว้");
+                System.out.println("  ใส่ \"-Dwait=<วินาที>\" ถ้าต้องการให้รอจนเปิด");
+                return;
+            }
+            System.out.println("ไม่มีโครงที่บันทึกไว้ ต้องรออ่านจากหน้าเว็บก่อน (ช้ากว่าราว 1 วินาที)");
+            System.out.println("รอฟอร์มเปิด (รอไม่เกิน " + waitSeconds + " วิ, เช็กทุก " + pollSeconds + " วิ)");
+            try {
+                fields = form.waitUntilOpen(Duration.ofSeconds(pollSeconds), Duration.ofSeconds(waitSeconds));
+            } catch (FormClosedException | IllegalStateException e) {
+                System.out.println(e.getMessage());
+                return;
+            }
+            FormSchema.save(schemaFile, url, fields);
+            System.out.println("ฟอร์มเปิดแล้ว");
         }
         List<FormField> questions = fields;
         printFields(questions);
@@ -278,8 +281,9 @@ public class App {
                 lastFailure = e;
                 if (Instant.now().isBefore(openingWindow)) {
                     // Still inside the window we were told to wait: the form has probably not
-                    // started accepting yet, so keep knocking instead of giving up
-                    sleepMillis(250);
+                    // started accepting yet, so keep knocking instead of giving up. One attempt
+                    // already costs ~0.8s on the wire, so the pause here is kept short.
+                    sleepMillis(100);
                     continue;
                 }
                 if (attempt >= maxAttempts) {
