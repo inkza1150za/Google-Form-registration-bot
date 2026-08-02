@@ -641,6 +641,29 @@ mvn -q compile exec:java "-Dform.url=..." "-Dsubmit=true"
 
 ไม่ครอบ PowerShell จะแย่ง `-D` ไปตีความเป็น parameter ของตัวเอง บน bash/cmd ไม่ต้องครอบ
 
+### `Unable to access jarfile target\form-bot.jar`
+
+ยังไม่ได้สร้าง jar บนเครื่องนั้น — `target/` เป็นผลลัพธ์ build ไม่ได้ commit ขึ้น git
+
+```bash
+mvn package
+```
+
+### เครื่องที่เพิ่ง clone มาต้องเตรียม 3 อย่าง
+
+ทั้งหมดอยู่ใน `.gitignore` จึงไม่ติดมากับ git
+
+| ไฟล์ | ได้มายังไง |
+|---|---|
+| `target/form-bot.jar` | `mvn package` |
+| `people.csv` | สร้างเอง หัวตารางต้องตรงกับชื่อคำถามในฟอร์ม |
+| `schema.tsv` | ก๊อปจากเครื่องเดิม หรือรัน `mvn -q compile exec:java "-Dform.url=<URL>" "-Dmode=http"` ตอนฟอร์มเปิด |
+
+เช็กก่อนรันจริง:
+```powershell
+Test-Path target\form-bot.jar, schema.tsv, people.csv
+```
+
 ### `'mvn' is not recognized`
 
 Maven ยังไม่อยู่ใน PATH หรือยังไม่ได้เปิด terminal ใหม่หลังติดตั้ง

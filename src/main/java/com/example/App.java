@@ -164,6 +164,8 @@ public class App {
             rows = List.of(answers);
         }
 
+        printMatches(questions, rows.get(0));
+
         Set<Integer> alreadySent = fromCsv ? readSentRows(resultsFile) : Set.of();
         if (!alreadySent.isEmpty()) {
             System.out.println("มี " + alreadySent.size() + " แถวที่ส่งไปแล้วตาม " + resultsFile + " — จะข้ามให้");
@@ -347,6 +349,7 @@ public class App {
             return;
         }
 
+        printMatches(fields, answers);
         int filled = fill(bot, fields, answers, true);
         System.out.println();
         if (filled == 0) {
@@ -432,9 +435,11 @@ public class App {
      * URL instead of being typed one keystroke at a time.
      */
     private static Map<String, String> entryValues(List<FormField> fields, Map<String, String> answers) {
+        Map<Integer, String> keyByIndex = matchKeys(fields, answers.keySet());
         Map<String, String> values = new LinkedHashMap<>();
         for (FormField field : fields) {
-            String answer = matchAnswer(field, answers);
+            String key = keyByIndex.get(field.index());
+            String answer = key == null ? null : answers.get(key);
             if (answer == null) {
                 if (field.required()) {
                     System.out.println("   ไม่มีคำตอบให้ข้อที่จำเป็น: " + field.title());
@@ -452,9 +457,11 @@ public class App {
 
     /** Fills every field that has a matching answer. Returns how many were filled. */
     private static int fill(GoogleFormBot bot, List<FormField> fields, Map<String, String> answers, boolean verbose) {
+        Map<Integer, String> keyByIndex = matchKeys(fields, answers.keySet());
         int filled = 0;
         for (FormField field : fields) {
-            String answer = matchAnswer(field, answers);
+            String key = keyByIndex.get(field.index());
+            String answer = key == null ? null : answers.get(key);
             if (answer == null) {
                 if (verbose) {
                     System.out.println((field.required() ? "ข้าม (จำเป็นต้องตอบ!): " : "ข้าม: ") + field.title());
@@ -477,27 +484,113 @@ public class App {
     }
 
     /**
-     * Matches "[index]" first — the only way to tell apart questions that share a title —
-     * then an exact title, then a case-insensitive "contains" fallback.
+     * Decides which answer key belongs to which question.
+     *
+     * <p>Form questions are rarely worded like our column headers — "เลขที่" has to find
+     * "เลขที่ผู้สมัคร (9 หลัก)". So every question is scored against every key and the strongest
+     * pairs are taken first, each key being spent only once. Scoring the whole set instead of
+     * taking the first partial hit is what stops a short key like "ชื่อ" from claiming a question
+     * that a longer key fits better.
+     *
+     * @return the chosen key for each question, by question index
      */
-    private static String matchAnswer(FormField field, Map<String, String> answers) {
-        String byIndex = answers.get("[" + field.index() + "]");
-        if (byIndex != null) {
-            return byIndex;
-        }
-        String exact = answers.get(field.title());
-        if (exact != null) {
-            return exact;
-        }
-        for (Map.Entry<String, String> entry : answers.entrySet()) {
-            if (entry.getKey().startsWith("[")) {
-                continue; // an index key that pointed at a different question
-            }
-            if (field.title().toLowerCase().contains(entry.getKey().toLowerCase())) {
-                return entry.getValue();
+    private static Map<Integer, String> matchKeys(List<FormField> fields, Set<String> keys) {
+        Map<Integer, String> chosen = new LinkedHashMap<>();
+        Set<String> spent = new HashSet<>();
+
+        // "[2] = ..." names a question outright and always wins
+        for (FormField field : fields) {
+            String indexKey = "[" + field.index() + "]";
+            if (keys.contains(indexKey)) {
+                chosen.put(field.index(), indexKey);
+                spent.add(indexKey);
             }
         }
-        return null;
+
+        List<int[]> ranked = new ArrayList<>();
+        List<String> keyList = new ArrayList<>(keys);
+        for (FormField field : fields) {
+            if (chosen.containsKey(field.index())) {
+                continue;
+            }
+            for (int k = 0; k < keyList.size(); k++) {
+                String key = keyList.get(k);
+                if (key.startsWith("[")) {
+                    continue;
+                }
+                int score = similarity(field.title(), key);
+                if (score > 0) {
+                    ranked.add(new int[] {score, field.index(), k});
+                }
+            }
+        }
+        ranked.sort((a, b) -> Integer.compare(b[0], a[0]));
+
+        for (int[] pair : ranked) {
+            String key = keyList.get(pair[2]);
+            if (chosen.containsKey(pair[1]) || spent.contains(key)) {
+                continue;
+            }
+            chosen.put(pair[1], key);
+            spent.add(key);
+        }
+        return chosen;
+    }
+
+    /** Higher means a better fit; 0 means the two are unrelated. */
+    private static int similarity(String title, String key) {
+        String t = normalize(title);
+        String k = normalize(key);
+        if (t.isEmpty() || k.isEmpty()) {
+            return 0;
+        }
+        // a longer key that still fits is more specific, so it earns more
+        if (t.equals(k)) {
+            return 10_000 + k.length();
+        }
+        if (t.startsWith(k)) {
+            return 8_000 + k.length();
+        }
+        if (t.contains(k)) {
+            return 6_000 + k.length();
+        }
+        if (k.contains(t)) {
+            return 4_000 + t.length();
+        }
+        return 0;
+    }
+
+    /** Drops the parts that differ between a column header and the question it belongs to. */
+    private static String normalize(String text) {
+        return text.toLowerCase()
+                .replaceAll("\\([^)]*\\)", "")   // "(9 หลัก)", "(ตรงกับในระบบ SC-Market)"
+                .replaceAll("[\\s\\-_.:*/,]", "")
+                .trim();
+    }
+
+    /** Shows which column ended up feeding which question, so a wrong guess is caught before sending. */
+    private static void printMatches(List<FormField> fields, Map<String, String> answers) {
+        Map<Integer, String> keyByIndex = matchKeys(fields, answers.keySet());
+        System.out.println("จับคู่คำถามกับข้อมูลได้แบบนี้");
+        for (FormField field : fields) {
+            String key = keyByIndex.get(field.index());
+            if (key != null) {
+                System.out.println("  " + field.title() + "  ←  " + key);
+            } else {
+                System.out.println("  " + field.title() + "  ←  (ไม่มีข้อมูลให้)"
+                        + (field.required() ? "  ** ข้อนี้บังคับตอบ **" : ""));
+            }
+        }
+        List<String> unused = new ArrayList<>();
+        for (String key : answers.keySet()) {
+            if (!keyByIndex.containsValue(key)) {
+                unused.add(key);
+            }
+        }
+        if (!unused.isEmpty()) {
+            System.out.println("  ไม่ได้ใช้: " + String.join(", ", unused));
+        }
+        System.out.println();
     }
 
     /** Questions sharing a title cannot be told apart by name, so point the user at index keys. */
