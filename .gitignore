@@ -8,5 +8,7 @@ target/
 # VS Code
 .vscode/
 
-# ไฟล์คำตอบ มีข้อมูลส่วนตัว
+# ไฟล์ข้อมูลคน มีข้อมูลส่วนตัว
 answers.txt
+people.csv
+results.csv

@@ -1,10 +1,19 @@
 package com.example;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.openqa.selenium.By;
 import org.openqa.selenium.JavascriptExecutor;
+import org.openqa.selenium.PageLoadStrategy;
 import org.openqa.selenium.TimeoutException;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
@@ -17,6 +26,13 @@ import org.openqa.selenium.support.ui.WebDriverWait;
  * Drives a Google Form: reads its questions, fills them in, and submits.
  */
 public class GoogleFormBot implements AutoCloseable {
+
+    static {
+        // Selenium warns that it has no CDP bindings for the installed Chrome. We never use CDP.
+        Logger.getLogger("org.openqa.selenium").setLevel(Level.SEVERE);
+    }
+
+    private static final Pattern ENTRY_ID = Pattern.compile("\\[\\[(\\d+),");
 
     private static final By QUESTION = By.cssSelector("div[role='listitem']");
     private static final By HEADING = By.cssSelector("div[role='heading']");
@@ -35,6 +51,9 @@ public class GoogleFormBot implements AutoCloseable {
             options.addArguments("--headless=new");
         }
         options.addArguments("--window-size=1280,1400");
+        // The questions are in the initial HTML, so there is no reason to wait for images and fonts
+        options.setPageLoadStrategy(PageLoadStrategy.EAGER);
+        options.addArguments("--blink-settings=imagesEnabled=false");
         this.driver = new ChromeDriver(options);
         this.wait = new WebDriverWait(driver, Duration.ofSeconds(20));
     }
@@ -42,6 +61,9 @@ public class GoogleFormBot implements AutoCloseable {
     /** Opens the form and waits for its questions to render. Returns the page title. */
     public String open(String url) {
         driver.get(url);
+        if (isClosed()) {
+            throw new FormClosedException("ฟอร์มยังไม่เปิดรับคำตอบ (Google เด้งไปหน้า closedform)");
+        }
         try {
             wait.until(ExpectedConditions.presenceOfElementLocated(QUESTION));
         } catch (TimeoutException e) {
@@ -50,6 +72,45 @@ public class GoogleFormBot implements AutoCloseable {
                             + " (หน้าที่เปิดได้คือ \"" + driver.getTitle() + "\")", e);
         }
         return driver.getTitle();
+    }
+
+    /**
+     * Reloads the form every {@code pollEvery} until it starts accepting responses.
+     * Returns the page title once it is open.
+     *
+     * @throws FormClosedException if it is still closed when {@code giveUpAfter} runs out
+     */
+    public String waitUntilOpen(String url, Duration pollEvery, Duration giveUpAfter) {
+        Instant deadline = Instant.now().plus(giveUpAfter);
+        int attempt = 0;
+        while (true) {
+            attempt++;
+            try {
+                return open(url);
+            } catch (FormClosedException e) {
+                if (Instant.now().isAfter(deadline)) {
+                    throw new FormClosedException(
+                            "รอจนหมดเวลาแล้วฟอร์มยังไม่เปิด (ลองไป " + attempt + " ครั้ง)");
+                }
+                System.out.println("  ครั้งที่ " + attempt + ": ยังปิดอยู่ รออีก " + pollEvery.toSeconds() + " วิ");
+                sleep(pollEvery);
+            }
+        }
+    }
+
+    /** Google redirects a form that is not accepting responses to a /closedform URL. */
+    private boolean isClosed() {
+        String current = driver.getCurrentUrl();
+        return current != null && current.contains("closedform");
+    }
+
+    private void sleep(Duration duration) {
+        try {
+            Thread.sleep(duration.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("ถูกสั่งหยุดระหว่างรอฟอร์มเปิด", e);
+        }
     }
 
     public List<FormField> readFields() {
@@ -66,7 +127,8 @@ public class GoogleFormBot implements AutoCloseable {
             String title = required ? rawTitle.substring(0, rawTitle.length() - 1).trim() : rawTitle;
 
             FormField.Type type = detectType(container);
-            fields.add(new FormField(index++, title, type, required, readOptions(container, type), container));
+            fields.add(new FormField(index++, title, type, required,
+                    readOptions(container, type), readEntryId(container), container));
         }
         return fields;
     }
@@ -94,6 +156,51 @@ public class GoogleFormBot implements AutoCloseable {
             return FormField.Type.SHORT_TEXT;
         }
         return FormField.Type.UNKNOWN;
+    }
+
+    /**
+     * Every answerable question carries an {@code entry.NNN} name. That name is what a prefilled
+     * link uses, which lets us hand the answers to Google in the URL instead of typing them.
+     */
+    private String readEntryId(WebElement container) {
+        String params = container.getDomAttribute("data-params");
+        if (params == null) {
+            for (WebElement element : container.findElements(By.cssSelector("[data-params]"))) {
+                params = element.getDomAttribute("data-params");
+                if (params != null) {
+                    break;
+                }
+            }
+        }
+        if (params == null) {
+            return null;
+        }
+        // data-params looks like  %.@.[<questionId>,"title",...,[[<entryId>,...]]...]
+        // and it is the inner id that a prefilled link expects.
+        Matcher matcher = ENTRY_ID.matcher(params);
+        return matcher.find() ? "entry." + matcher.group(1) : null;
+    }
+
+    /**
+     * Builds a prefilled form link. Opening it renders the form with the answers already in place,
+     * so the only thing left to do is press submit.
+     */
+    public static String prefilledUrl(String formUrl, Map<String, String> answersByEntryId) {
+        StringBuilder url = new StringBuilder(formUrl);
+        url.append(formUrl.contains("?") ? '&' : '?');
+        boolean first = true;
+        for (Map.Entry<String, String> entry : answersByEntryId.entrySet()) {
+            for (String value : entry.getValue().split("\\s*,\\s*")) {
+                if (!first) {
+                    url.append('&');
+                }
+                url.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8))
+                        .append('=')
+                        .append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+                first = false;
+            }
+        }
+        return url.toString();
     }
 
     private List<String> readOptions(WebElement container, FormField.Type type) {

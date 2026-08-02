@@ -12,6 +12,7 @@ public record FormField(
         Type type,
         boolean required,
         List<String> options,
+        String entryId,
         WebElement container) {
 
     public enum Type {
