@@ -12,10 +12,10 @@ import java.util.regex.Pattern;
 /**
  * Remembers a form's questions between runs.
  *
- * <p>A form that has not opened yet shows no questions, so a run that waits for opening has to
- * download and parse the page before it can send anything — a second we cannot spare when the form
- * opens on the dot. Saving the questions from an earlier run lets the next one fire immediately,
- * using the {@code entry.NNN} names it already knows.
+ * <p>A form that has not opened yet shows nothing to read, so a run that waits for opening would
+ * have to download and parse the page before it could send anything — a second we cannot spare
+ * when the form opens on the dot. Saving the questions from an earlier run lets the next one fire
+ * immediately, using the {@code entry.NNN} names and section layout it already knows.
  */
 final class FormSchema {
 
@@ -40,7 +40,7 @@ final class FormSchema {
         return Path.of("schema-" + idOf(formUrl) + ".tsv");
     }
 
-    /** Writes one question per line: {@code index<TAB>entryId<TAB>type<TAB>required<TAB>title}. */
+    /** One question per line: {@code index entryId type required page title options}, tab separated. */
     static void save(Path file, String formUrl, List<FormField> fields) {
         StringBuilder text = new StringBuilder("# โครงฟอร์มที่บันทึกไว้ ลบไฟล์นี้ถ้าฟอร์มเปลี่ยนคำถาม\n")
                 .append(OWNER_PREFIX).append(idOf(formUrl)).append('\n');
@@ -52,7 +52,9 @@ final class FormSchema {
                     .append(field.entryId()).append('\t')
                     .append(field.type()).append('\t')
                     .append(field.required()).append('\t')
-                    .append(field.title().replace('\t', ' ')).append('\n');
+                    .append(field.page()).append('\t')
+                    .append(clean(field.title())).append('\t')
+                    .append(encodeOptions(field)).append('\n');
         }
         try {
             Files.writeString(file, text.toString(), StandardCharsets.UTF_8);
@@ -86,16 +88,23 @@ final class FormSchema {
                 if (line.isBlank() || line.startsWith("#")) {
                     continue;
                 }
-                String[] cells = line.split("\t", 5);
-                if (cells.length < 5) {
+                String[] cells = line.split("\t", 7);
+                if (cells.length < 6) {
                     continue;
+                }
+                List<String> options = new ArrayList<>();
+                List<Integer> targets = new ArrayList<>();
+                if (cells.length == 7) {
+                    decodeOptions(cells[6], options, targets);
                 }
                 fields.add(new FormField(
                         Integer.parseInt(cells[0]),
-                        cells[4],
+                        cells[5],
                         FormField.Type.valueOf(cells[2]),
                         Boolean.parseBoolean(cells[3]),
-                        List.of(),
+                        List.copyOf(options),
+                        List.copyOf(targets),
+                        Integer.parseInt(cells[4]),
                         cells[1],
                         null));
             }
@@ -111,5 +120,41 @@ final class FormSchema {
             return List.of();
         }
         return fields;
+    }
+
+    /** {@code ตัวเลือก>หน้าปลายทาง|ตัวเลือก>หน้าปลายทาง} */
+    private static String encodeOptions(FormField field) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < field.options().size(); i++) {
+            if (i > 0) {
+                out.append('|');
+            }
+            int target = i < field.optionTargets().size() ? field.optionTargets().get(i) : FormField.CONTINUE;
+            out.append(clean(field.options().get(i))).append('>').append(target);
+        }
+        return out.toString();
+    }
+
+    private static void decodeOptions(String encoded, List<String> options, List<Integer> targets) {
+        if (encoded.isBlank()) {
+            return;
+        }
+        for (String pair : encoded.split("\\|")) {
+            int split = pair.lastIndexOf('>');
+            if (split < 0) {
+                continue;
+            }
+            options.add(pair.substring(0, split));
+            try {
+                targets.add(Integer.parseInt(pair.substring(split + 1).trim()));
+            } catch (NumberFormatException e) {
+                targets.add(FormField.CONTINUE);
+            }
+        }
+    }
+
+    /** Tabs, newlines and pipes would break the line format they are stored in. */
+    private static String clean(String text) {
+        return text == null ? "" : text.replaceAll("[\t\n\r|]", " ");
     }
 }

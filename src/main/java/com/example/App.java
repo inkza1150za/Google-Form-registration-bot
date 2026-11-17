@@ -244,13 +244,15 @@ public class App {
                 throw new IllegalStateException("คำตอบไม่ตรงกับคำถามในฟอร์มสักช่อง");
             }
             if (submit) {
-                int attempts = submitWithRetry(form, byEntryId, label, openingWindow);
+                String pageHistory = HttpFormClient.pageHistory(fields, byEntryId);
+                int attempts = submitWithRetry(form, byEntryId, pageHistory, label, openingWindow);
                 if (fromCsv) {
                     record(resultsFile, row, "ส่งแล้ว", describe(person));
                 }
                 System.out.println(label + " — ส่งแล้ว" + (attempts > 1 ? " (ลอง " + attempts + " ครั้ง)" : ""));
             } else {
-                System.out.println(label + " — เตรียมครบ " + byEntryId.size() + " ช่อง (ยังไม่ส่ง)");
+                System.out.println(label + " — เตรียมครบ " + byEntryId.size() + " ช่อง (ยังไม่ส่ง)"
+                        + "  เส้นทางหน้า: " + HttpFormClient.pageHistory(fields, byEntryId));
             }
             sent.incrementAndGet();
         } catch (RuntimeException e) {
@@ -269,13 +271,13 @@ public class App {
      *
      * @return how many attempts it took
      */
-    private static int submitWithRetry(HttpFormClient form, Map<String, String> byEntryId, String label,
-            Instant openingWindow) {
+    private static int submitWithRetry(HttpFormClient form, Map<String, String> byEntryId, String pageHistory,
+            String label, Instant openingWindow) {
         int maxAttempts = (int) Math.max(1, seconds("retry", 3));
         RuntimeException lastFailure = null;
         for (int attempt = 1; ; attempt++) {
             try {
-                form.submit(byEntryId);
+                form.submit(byEntryId, pageHistory);
                 return attempt;
             } catch (RuntimeException e) {
                 lastFailure = e;
@@ -451,12 +453,13 @@ public class App {
     private static Map<String, String> entryValues(List<FormField> fields, Map<String, String> answers) {
         Map<Integer, String> keyByIndex = matchKeys(fields, answers.keySet());
         Map<String, String> values = new LinkedHashMap<>();
+        List<FormField> unanswered = new ArrayList<>();
         for (FormField field : fields) {
             String key = keyByIndex.get(field.index());
             String answer = key == null ? null : answers.get(key);
             if (answer == null) {
                 if (field.required()) {
-                    System.out.println("   ไม่มีคำตอบให้ข้อที่จำเป็น: " + field.title());
+                    unanswered.add(field);
                 }
                 continue;
             }
@@ -465,6 +468,15 @@ public class App {
                 continue;
             }
             values.put(field.entryId(), answer);
+        }
+
+        // A required question on a section the answers never route through is not a problem —
+        // warning about it would send people hunting for data the form will never ask them for
+        Set<String> visited = Set.of(HttpFormClient.pageHistory(fields, values).split(","));
+        for (FormField field : unanswered) {
+            if (visited.contains(String.valueOf(field.page()))) {
+                System.out.println("   ไม่มีคำตอบให้ข้อที่จำเป็น: " + field.title());
+            }
         }
         return values;
     }
